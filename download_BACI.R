@@ -9,7 +9,7 @@ library(data.table)  # For faster processing of large data
 library(dplyr)
 library(readr)
 library(stringr)
-
+library(readxl)
 # =============================================================================
 # 1. SETUP DIRECTORIES
 # =============================================================================
@@ -124,7 +124,7 @@ head(concordance)
 aggregate_baci_countries <- function(
     input_dir = "data/baci",
     output_dir = "data/baci-agg",
-    country_codes_file = "country_codes_V202501.csv",
+    country_codes_file = "data/baci/country_codes_V202501.csv",
     top_n = 100,
     reference_year = 2023
 ) {
@@ -165,33 +165,22 @@ aggregate_baci_countries <- function(
   cat("Top 10:\n")
   print(country_ranking %>% slice(1:10))
   
+  # Read regional mapping from CSV
+  regions_df <- read_csv("data/concordances/regions.csv")
+  
   # Define regional groups for remaining countries
   region_mapping <- country_codes %>%
     filter(!(country_code %in% top_countries)) %>%
+    left_join(regions_df, by = "country_code") %>%
     mutate(
+      # Map region values (1-5) to region codes (9001-9005)
       region_code = case_when(
-        # Asia (excluding top countries)
-        country_code %in% c(4, 50, 64, 96, 144, 360, 364, 392, 398, 408, 410, 417, 418, 
-                            458, 462, 496, 104, 524, 586, 608, 702, 764, 762, 626, 704, 
-                            860, 887, 446, 344, 583, 584, 585) ~ 9001,
-        # Africa
-        country_code %in% c(12, 24, 72, 108, 120, 140, 148, 174, 175, 178, 180, 204, 
-                            226, 231, 232, 262, 266, 270, 288, 324, 384, 404, 426, 430, 
-                            434, 450, 454, 466, 478, 480, 504, 508, 516, 562, 566, 646, 
-                            678, 686, 690, 694, 706, 710, 716, 728, 729, 736, 768, 800, 
-                            818, 834, 854, 894) ~ 9002,
-        # Americas (excluding top countries)
-        country_code %in% c(28, 44, 52, 84, 92, 136, 188, 212, 214, 218, 222, 308, 
-                            312, 320, 328, 332, 340, 388, 558, 591, 600, 604, 630, 
-                            659, 660, 662, 670, 740, 780, 796, 850, 858, 862) ~ 9003,
-        # Europe (excluding top countries)
-        country_code %in% c(8, 20, 31, 40, 51, 70, 100, 112, 191, 196, 203, 208, 
-                            233, 234, 246, 268, 292, 300, 304, 336, 348, 352, 372, 
-                            428, 438, 440, 442, 470, 492, 498, 499, 500, 528, 578, 
-                            616, 620, 642, 674, 688, 703, 705, 724, 744, 752, 757, 
-                            795, 804, 807, 826, 891) ~ 9004,
-        # Small Island States & Others
-        TRUE ~ 9005
+        region == 1 ~ 9001,  # Rest of Europe
+        region == 2 ~ 9002,  # Rest of Asia
+        region == 3 ~ 9003,  # Rest of Africa
+        region == 4 ~ 9004,  # Rest of Americas
+        region == 5 ~ 9005,  # Else
+        TRUE ~ 9005          # Default to Else if missing
       )
     ) %>%
     select(country_code, region_code)
@@ -270,130 +259,268 @@ aggregate_baci_countries <- function(
 result <- aggregate_baci_countries()
 
 # =============================================================================
-# 7. AGGREGATE BACI DATA
+# 7. AGGREGATE BACI HS6 CODES TO ISIC INDUSTRY CATEGORIES
 # =============================================================================
 
-aggregate_baci <- function(baci_data, concordance, top_50_countries) {
+aggregate_hs6_to_isic <- function(
+    input_dir = "data/baci-agg",
+    concordance_file = "data/concordances/BTDIxEConvKey.xlsx",
+    industry_codes_file = "data/concordances/industry_codes.csv",
+    backup = TRUE
+) {
   
-  cat("Starting aggregation...\n")
-  
-  # Step 1: Add ISIC codes
-  cat("Step 1: Merging HS6 to ISIC concordance...\n")
-  baci_with_isic <- baci_data %>%
-    mutate(k = as.character(k)) %>%  # HS6 code
-    left_join(concordance, by = c("k" = "hs6"))
-  
-  # Check for unmatched HS6 codes
-  unmatched <- sum(is.na(baci_with_isic$isic))
-  cat("Unmatched HS6 codes:", unmatched, 
-      "(", round(unmatched/nrow(baci_with_isic)*100, 2), "%)\n")
-  
-  # Remove unmatched
-  baci_with_isic <- baci_with_isic %>%
-    filter(!is.na(isic))
-  
-  # Step 2: Assign country groups (top 50 + RoW regions)
-  cat("Step 2: Assigning country groups...\n")
-  baci_grouped <- baci_with_isic %>%
+  # Load HS6 to ISIC concordance
+  cat("Loading HS6 to ISIC concordance...\n")
+  concordance <- read_excel(concordance_file, sheet = 2) %>%
+    select(hs6 = 'product', isic = 'Desci4') %>%
     mutate(
-      exporter_group = map_chr(i, ~assign_row_regions(.x, top_50_countries)),
-      importer_group = map_chr(j, ~assign_row_regions(.x, top_50_countries))
+      hs6 = as.character(hs6),
+      isic = as.character(isic)
     )
   
-  # Step 3: Aggregate to ISIC sector and country group level
-  cat("Step 3: Aggregating to ISIC sectors and country groups...\n")
-  baci_aggregated <- baci_grouped %>%
-    group_by(t, exporter_group, importer_group, isic) %>%
-    summarise(
-      trade_value = sum(v, na.rm = TRUE),
-      trade_quantity = sum(q, na.rm = TRUE),
-      n_hs6_products = n_distinct(k),
-      .groups = 'drop'
-    ) %>%
-    rename(
-      year = t,
-      exporter = exporter_group,
-      importer = importer_group,
-      sector = isic
+  cat(sprintf("Concordance loaded: %d HS6 codes -> %d ISIC codes\n", 
+              n_distinct(concordance$hs6), 
+              n_distinct(concordance$isic)))
+  
+  # Load industry code replacements
+  cat("Loading industry code replacements...\n")
+  industry_replacements <- read_csv(industry_codes_file, show_col_types = FALSE) %>%
+    rename(BTDI = 1, conversion = 2) %>%
+    mutate(
+      BTDI = as.character(BTDI),
+      conversion = as.character(conversion)
     )
   
-  cat("\nAggregation complete!\n")
-  cat("Final dataset:\n")
-  cat("Rows:", nrow(baci_aggregated), "\n")
-  cat("Years:", paste(range(baci_aggregated$year), collapse = " to "), "\n")
-  cat("Exporters:", n_distinct(baci_aggregated$exporter), "\n")
-  cat("Importers:", n_distinct(baci_aggregated$importer), "\n")
-  cat("Sectors:", n_distinct(baci_aggregated$sector), "\n")
+  cat(sprintf("Industry replacements loaded: %d codes to be replaced\n", 
+              nrow(industry_replacements)))
   
-  return(baci_aggregated)
-}
-
-# =============================================================================
-# 8. EXECUTE FULL PIPELINE
-# =============================================================================
-
-run_baci_aggregation <- function() {
+  # Preview replacements
+  cat("\nReplacement mapping preview:\n")
+  print(head(industry_replacements, 10))
   
-  # Load BACI data
-  cat("\n=== LOADING BACI DATA ===\n")
-  baci <- load_baci(year_range = 2000:2015)
+  # Create backup directory if requested
+  if (backup) {
+    backup_dir <- file.path(input_dir, "backup_hs6")
+    if (!dir.exists(backup_dir)) {
+      dir.create(backup_dir, recursive = TRUE)
+      cat(sprintf("\nCreated backup directory: %s\n", backup_dir))
+    }
+  }
   
-  # Define top 50 countries
-  cat("\n=== DEFINING COUNTRY GROUPS ===\n")
-  top_50 <- define_country_groups(baci)
+  # Get all BACI files
+  all_files <- list.files(input_dir, 
+                          pattern = "BACI_HS02_Y.*_V202501\\.csv", 
+                          full.names = TRUE)
   
-  # Load concordance (make sure file exists!)
-  cat("\n=== LOADING CONCORDANCE ===\n")
-  concordance <- load_concordance("data/concordances/hs6_to_isic.xlsx")
+  if (length(all_files) == 0) {
+    stop("No BACI files found in ", input_dir)
+  }
   
-  # Aggregate
-  cat("\n=== AGGREGATING DATA ===\n")
-  baci_final <- aggregate_baci(baci, concordance, top_50)
+  cat(sprintf("\nProcessing %d files...\n", length(all_files)))
   
-  # Save processed data
-  cat("\n=== SAVING PROCESSED DATA ===\n")
-  saveRDS(baci_final, "data/processed/baci_aggregated_isic.rds")
-  write_csv(baci_final, "data/processed/baci_aggregated_isic.csv")
-  
-  cat("\nProcessing complete! Files saved in data/processed/\n")
-  
-  return(baci_final)
-}
-
-# =============================================================================
-# 9. RUN THE PIPELINE
-# =============================================================================
-
-# Execute (this will take time for large files)
-baci_aggregated <- run_baci_aggregation()
-
-# =============================================================================
-# 10. EXPLORE AGGREGATED DATA
-# =============================================================================
-
-# Quick exploration
-glimpse(baci_aggregated)
-
-# Summary statistics
-baci_aggregated %>%
-  group_by(year) %>%
-  summarise(
-    total_trade = sum(trade_value),
-    n_flows = n(),
-    n_exporters = n_distinct(exporter),
-    n_importers = n_distinct(importer)
+  # Track statistics
+  stats <- data.frame(
+    year = character(),
+    original_rows = numeric(),
+    after_isic_agg = numeric(),
+    after_replacement = numeric(),
+    after_filtering = numeric(),
+    unmatched_hs6 = numeric(),
+    codes_replaced = numeric(),
+    n_final_isic_codes = numeric(),
+    stringsAsFactors = FALSE
   )
+  
+  for (file in all_files) {
+    year <- str_extract(basename(file), "(?<=Y)\\d{4}")
+    cat(sprintf("\n=== Processing year %s ===\n", year))
+    
+    # Backup original file
+    if (backup) {
+      backup_file <- file.path(dirname(file), "backup_hs6", basename(file))
+      file.copy(file, backup_file, overwrite = TRUE)
+      cat(sprintf("  Backed up to: %s\n", backup_file))
+    }
+    
+    # Read data
+    data <- read_csv(file, show_col_types = FALSE)
+    original_rows <- nrow(data)
+    
+    # Convert k to character for matching
+    data <- data %>%
+      mutate(k = as.character(k))
+    
+    # Join with concordance
+    data_with_isic <- data %>%
+      left_join(concordance, by = c("k" = "hs6"))
+    
+    # Check for unmatched codes
+    unmatched <- data_with_isic %>%
+      filter(is.na(isic))
+    
+    if (nrow(unmatched) > 0) {
+      cat(sprintf("  WARNING: %d rows with unmatched HS6 codes (%.2f%% of data)\n", 
+                  nrow(unmatched), 
+                  100 * nrow(unmatched) / nrow(data)))
+      cat(sprintf("  Unique unmatched HS6 codes: %d\n", 
+                  n_distinct(unmatched$k)))
+    }
+    
+    # Step 1: Aggregate to ISIC level
+    cat("\n  Step 1: Aggregating to ISIC level...\n")
+    aggregated_data <- data_with_isic %>%
+      filter(!is.na(isic)) %>%  # Remove unmatched codes
+      group_by(i, j, k = isic, t) %>%
+      summarise(
+        v = sum(v, na.rm = TRUE),
+        q = sum(q, na.rm = TRUE),
+        .groups = "drop"
+      )
+    
+    after_isic_rows <- nrow(aggregated_data)
+    cat(sprintf("  After ISIC aggregation: %d rows\n", after_isic_rows))
+    
+    # Step 2: Replace industry codes
+    cat("\n  Step 2: Replacing industry codes...\n")
+    codes_before <- n_distinct(aggregated_data$k)
+    
+    aggregated_data <- aggregated_data %>%
+      left_join(industry_replacements, by = c("k" = "BTDI")) %>%
+      mutate(k = if_else(!is.na(conversion), conversion, k)) %>%
+      select(-conversion)
+    
+    codes_replaced <- codes_before - n_distinct(aggregated_data$k)
+    cat(sprintf("  Industry codes before replacement: %d\n", codes_before))
+    cat(sprintf("  Industry codes after replacement: %d\n", n_distinct(aggregated_data$k)))
+    cat(sprintf("  Codes consolidated: %d\n", codes_replaced))
+    
+    # Re-aggregate after replacement (codes may have been merged)
+    cat("\n  Step 3: Re-aggregating after code replacement...\n")
+    aggregated_data <- aggregated_data %>%
+      group_by(i, j, k, t) %>%
+      summarise(
+        v = sum(v, na.rm = TRUE),
+        q = sum(q, na.rm = TRUE),
+        .groups = "drop"
+      )
+    
+    after_replacement_rows <- nrow(aggregated_data)
+    cat(sprintf("  After re-aggregation: %d rows\n", after_replacement_rows))
+    
+    # Step 4: Filter to keep only D10 to D32
+    cat("\n  Step 4: Filtering to keep only D10-D32...\n")
+    
+    # Extract numeric part and filter
+    aggregated_data <- aggregated_data %>%
+      mutate(code_num = as.numeric(str_extract(k, "(?<=D)\\d+"))) %>%
+      filter(!is.na(code_num), code_num >= 10, code_num <= 32) %>%
+      select(-code_num)
+    
+    after_filtering_rows <- nrow(aggregated_data)
+    final_codes <- n_distinct(aggregated_data$k)
+    
+    cat(sprintf("  After filtering D10-D32: %d rows\n", after_filtering_rows))
+    cat(sprintf("  Final number of ISIC codes: %d\n", final_codes))
+    cat(sprintf("  Final ISIC codes: %s\n", paste(sort(unique(aggregated_data$k)), collapse = ", ")))
+    
+    # Save aggregated file (overwrite original)
+    write_csv(aggregated_data, file)
+    
+    # Summary for this year
+    cat(sprintf("\n  === Year %s Summary ===\n", year))
+    cat(sprintf("  Original rows: %d\n", original_rows))
+    cat(sprintf("  Final rows: %d (%.1f%% reduction)\n", 
+                after_filtering_rows, 
+                100 * (1 - after_filtering_rows/original_rows)))
+    cat(sprintf("  Final ISIC codes: %d\n", final_codes))
+    
+    # Store statistics
+    stats <- bind_rows(stats, data.frame(
+      year = year,
+      original_rows = original_rows,
+      after_isic_agg = after_isic_rows,
+      after_replacement = after_replacement_rows,
+      after_filtering = after_filtering_rows,
+      unmatched_hs6 = nrow(unmatched),
+      codes_replaced = codes_replaced,
+      n_final_isic_codes = final_codes,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Save summary statistics
+  summary_file <- file.path(input_dir, "aggregation_summary_isic.csv")
+  write_csv(stats, summary_file)
+  cat(sprintf("\n=== Summary statistics saved to: %s ===\n", summary_file))
+  
+  cat("\n=== AGGREGATION COMPLETE ===\n")
+  cat(sprintf("Total files processed: %d\n", nrow(stats)))
+  cat(sprintf("Average row reduction: %.1f%%\n", 
+              100 * mean(1 - stats$after_filtering/stats$original_rows)))
+  cat(sprintf("Average final ISIC codes per year: %.1f\n", 
+              mean(stats$n_final_isic_codes)))
+  
+  # Overall summary
+  cat("\nOverall statistics:\n")
+  print(stats)
+  
+  return(stats)
+}
 
-# Top sectors by trade value
-baci_aggregated %>%
-  group_by(sector) %>%
-  summarise(total_trade = sum(trade_value)) %>%
-  arrange(desc(total_trade))
+# Run the function
+stats <- aggregate_hs6_to_isic()
 
-# Top country pairs
-baci_aggregated %>%
-  group_by(exporter, importer) %>%
-  summarise(total_trade = sum(trade_value), .groups = 'drop') %>%
-  arrange(desc(total_trade)) %>%
-  head(20)
+# View detailed summary
+print(stats)
+
+# Check which ISIC codes are in the final dataset
+final_codes <- read_csv("data/baci-agg/BACI_HS02_Y2015_V202501.csv") %>%
+  distinct(k) %>%
+  arrange(k)
+
+cat("\nFinal ISIC codes in dataset:\n")
+print(final_codes)
+
+
+
+
+
+
+
+
+
+
+##################################################
+###### CODE TO RESTORE BACKUP (backup-hs6) #######
+
+# First, restore the original HS6 files from backup
+#restore_from_backup <- function(input_dir = "data/baci-agg") {
+#  
+#  backup_dir <- file.path(input_dir, "backup_hs6")
+#  
+#  if (!dir.exists(backup_dir)) {
+#    stop("No backup directory found. You need the original HS6 files.")
+#  }
+#  
+#  backup_files <- list.files(backup_dir, 
+#                             pattern = "BACI_HS02_Y.*_V202501\\.csv",
+#                             full.names = TRUE)
+#  
+#  if (length(backup_files) == 0) {
+#    stop("No backup files found in ", backup_dir)
+#  }
+#  
+#  cat(sprintf("Restoring %d files from backup...\n", length(backup_files)))
+#  
+#  for (file in backup_files) {
+#    dest_file <- file.path(input_dir, basename(file))
+#    file.copy(file, dest_file, overwrite = TRUE)
+#    cat(sprintf("  Restored: %s\n", basename(file)))
+#  }
+#  
+#  cat("\nRestore complete!\n")
+#}
+
+# Restore original files
+#restore_from_backup()
 
